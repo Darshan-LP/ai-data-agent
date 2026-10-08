@@ -1,0 +1,42 @@
+services:
+  db:
+    image: postgres:16
+    container_name: ada_db
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_ADMIN_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_ADMIN_PASSWORD}
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./db/schema.sql:/docker-entrypoint-initdb.d/01_schema.sql:ro
+      - ./db/roles.sql:/docker-entrypoint-initdb.d/02_roles.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_ADMIN_USER} -d ${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  app:
+    build: .
+    container_name: ada_app
+    env_file: .env
+    environment:
+      POSTGRES_HOST: db
+    ports:
+      - "8001:8000"
+    volumes:
+      - ./app:/app/app
+      - ./db:/app/db
+      - ./ui:/app/ui
+      - ./eval:/app/eval
+      - ./tests:/app/tests
+      - ./outputs:/app/outputs
+    depends_on:
+      db:
+        condition: service_healthy
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+
+volumes:
+  pgdata:
