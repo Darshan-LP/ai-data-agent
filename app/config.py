@@ -1,12 +1,16 @@
 from functools import lru_cache
+
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class Settings(BaseSettings):
-    model_config = SettingsConfigDict(env_file=".env", extra="ignore")
+    model_config = SettingsConfigDict(
+        env_file=".env",
+        extra="ignore",
+    )
 
-    # Postgres
-    postgres_host: str = "db"
+    # PostgreSQL
+    postgres_host: str = "localhost"
     postgres_port: int = 5432
     postgres_db: str = "ai_data_agent"
     postgres_admin_user: str = "app_admin"
@@ -14,9 +18,9 @@ class Settings(BaseSettings):
     postgres_readonly_user: str = "app_readonly"
     postgres_readonly_password: str = ""
 
-    # Anthropic (used from Day 3)
-    anthropic_api_key: str = ""
-    anthropic_model: str = "claude-sonnet-4-20250514"
+    # OpenAI
+    openai_api_key: str = ""
+    openai_model: str = "gpt-5-nano"
 
     # App
     outputs_dir: str = "/app/outputs"
