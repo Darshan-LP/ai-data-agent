@@ -11,7 +11,6 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
-import pandas as pd
 from sqlalchemy import text
 from sqlalchemy.exc import SQLAlchemyError
 
@@ -70,13 +69,12 @@ def run_sql(sql: str) -> QueryResult:
 
     try:
         with engine.connect() as conn:
-            # Use a transaction so SET LOCAL applies to this query.
             with conn.begin():
                 conn.execute(text("SET LOCAL statement_timeout = '5s'"))
-                df = pd.read_sql_query(
-                    text(validation.rewritten_sql),
-                    conn,
-                )
+
+                result = conn.execute(text(validation.rewritten_sql))
+                columns = list(result.keys())
+                fetched_rows = result.fetchall()
 
     except SQLAlchemyError as exc:
         message = str(exc).splitlines()[0]
@@ -91,9 +89,11 @@ def run_sql(sql: str) -> QueryResult:
         )
 
     # Step 3: Return column names and at most 50 preview rows.
-    columns = list(df.columns)
-    total = len(df)
-    rows = df.head(PREVIEW_ROWS).values.tolist()
+    total = len(fetched_rows)
+    rows = [
+        list(row)
+        for row in fetched_rows[:PREVIEW_ROWS]
+    ]
 
     return QueryResult(
         ok=True,
