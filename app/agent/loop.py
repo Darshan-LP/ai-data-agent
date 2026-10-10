@@ -118,8 +118,10 @@ def run_agent(question: str) -> AgentRun:
                 instructions=instructions,
                 input=input_items,
                 tools=tools,
+                tool_choice="auto",
                 max_output_tokens=settings.max_tokens_per_run,
             )
+            
         except Exception as exc:
             error_message = str(exc).splitlines()[0]
 
@@ -234,7 +236,7 @@ def run_agent(question: str) -> AgentRun:
     return AgentRun(
         answer=(
             "I reached the maximum number of agent steps "
-            "before completing the request."
+            "before completing the request."    
         ),
         steps=steps,
         success=False,
