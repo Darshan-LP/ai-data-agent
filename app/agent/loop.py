@@ -1,18 +1,13 @@
 """
 Agent loop for the AI Data Agent using OpenAI.
-
-Flow:
-1. Send the user's question to GPT.
-2. GPT requests the run_sql_query tool when needed.
-3. Python dispatches the request through the existing SQL safety layer.
-4. The tool result is returned to GPT.
-5. GPT produces the final answer.
+Tracks generated chart and Excel artifacts.
 """
 
 from __future__ import annotations
 
 import json
 from dataclasses import dataclass, field
+from pathlib import PurePath, PurePosixPath
 from typing import Any
 
 from openai import OpenAI
@@ -39,12 +34,17 @@ class AgentRun:
     steps: list[Step]
     success: bool
     error: str | None = None
+    artifacts: list[dict[str, str]] = field(default_factory=list)
 
 
 def _jsonable(value: Any) -> Any:
     """Convert common Python values to JSON-compatible values."""
+
     if isinstance(value, dict):
-        return {str(key): _jsonable(item) for key, item in value.items()}
+        return {
+            str(key): _jsonable(item)
+            for key, item in value.items()
+        }
 
     if isinstance(value, (list, tuple)):
         return [_jsonable(item) for item in value]
@@ -59,7 +59,8 @@ def _jsonable(value: Any) -> Any:
 
 
 def _openai_tools() -> list[dict[str, Any]]:
-    """Convert our existing tool schemas to OpenAI function tools."""
+    """Convert our tool schemas to OpenAI function tools."""
+
     return [
         {
             "type": "function",
@@ -72,8 +73,75 @@ def _openai_tools() -> list[dict[str, Any]]:
     ]
 
 
+def _artifact_filename(raw_path: Any) -> str | None:
+    """Extract an allowed filename from a Windows or Linux path."""
+
+    if not isinstance(raw_path, str) or not raw_path.strip():
+        return None
+
+    normalized = raw_path.strip().replace("\\", "/")
+    filename = PurePosixPath(normalized).name
+
+    if not filename or filename in {".", ".."}:
+        return None
+
+    if PurePath(filename).suffix.lower() not in {
+        ".png",
+        ".html",
+        ".xlsx",
+    }:
+        return None
+
+    if "/" in filename or "\\" in filename:
+        return None
+
+    return filename
+
+
+def _collect_artifacts(
+    result: dict[str, Any],
+    artifacts: list[dict[str, str]],
+) -> None:
+    """Collect generated files from successful tools."""
+
+    if not result.get("ok", False):
+        return
+
+    path_fields = (
+        ("png_path", "Chart image", "image/png"),
+        ("html_path", "Interactive chart", "text/html"),
+        (
+            "excel_path",
+            "Excel report",
+            "application/vnd.openxmlformats-officedocument."
+            "spreadsheetml.sheet",
+        ),
+    )
+
+    existing_names = {
+        item["filename"]
+        for item in artifacts
+    }
+
+    for field_name, label, content_type in path_fields:
+        filename = _artifact_filename(result.get(field_name))
+
+        if filename is None or filename in existing_names:
+            continue
+
+        artifacts.append(
+            {
+                "filename": filename,
+                "label": label,
+                "content_type": content_type,
+            }
+        )
+
+        existing_names.add(filename)
+
+
 def run_agent(question: str) -> AgentRun:
-    """Run the OpenAI tool-calling loop for a user's question."""
+    """Run the OpenAI tool-calling loop."""
 
     question = question.strip()
 
@@ -96,14 +164,14 @@ def run_agent(question: str) -> AgentRun:
         )
 
     client = OpenAI(api_key=settings.openai_api_key)
-
     instructions = build_system_prompt()
     tools = _openai_tools()
+
     steps: list[Step] = []
-    sql_failures = 0
+    artifacts: list[dict[str, str]] = []
+    tool_failures = 0
     max_iterations = max(1, settings.max_agent_iterations)
 
-    # Responses API input can contain user messages and tool outputs.
     input_items: list[dict[str, Any]] = [
         {
             "role": "user",
@@ -121,7 +189,7 @@ def run_agent(question: str) -> AgentRun:
                 tool_choice="auto",
                 max_output_tokens=settings.max_tokens_per_run,
             )
-            
+
         except Exception as exc:
             error_message = str(exc).splitlines()[0]
 
@@ -129,7 +197,9 @@ def run_agent(question: str) -> AgentRun:
                 Step(
                     step_number=iteration,
                     action="api_error",
-                    details={"error": error_message},
+                    details={
+                        "error": error_message,
+                    },
                 )
             )
 
@@ -141,21 +211,20 @@ def run_agent(question: str) -> AgentRun:
                 steps=steps,
                 success=False,
                 error=error_message,
+                artifacts=artifacts,
             )
 
-        # Save the model's response items so the next request
-        # can continue the same tool-calling interaction.
         input_items.extend(
             item.model_dump(exclude_none=True)
             for item in response.output
         )
 
         function_calls = [
-            item for item in response.output
+            item
+            for item in response.output
             if item.type == "function_call"
         ]
 
-        # No tool call means GPT has returned its final answer.
         if not function_calls:
             answer = (response.output_text or "").strip()
 
@@ -177,38 +246,82 @@ def run_agent(question: str) -> AgentRun:
                 answer=answer,
                 steps=steps,
                 success=True,
+                artifacts=artifacts,
             )
 
         for call in function_calls:
             try:
                 arguments = json.loads(call.arguments)
-            except (json.JSONDecodeError, TypeError):
-                arguments = {}
 
-            steps.append(
-                Step(
-                    step_number=iteration,
-                    action="tool_call",
-                    details={
-                        "tool": call.name,
-                        "arguments": _jsonable(arguments),
-                    },
-                )
-            )
+                if not isinstance(arguments, dict):
+                    raise ValueError(
+                        "Tool arguments must be a JSON object."
+                    )
 
-            try:
-                result = dispatch(call.name, arguments)
-            except Exception as exc:
+            except (
+                json.JSONDecodeError,
+                TypeError,
+                ValueError,
+            ):
                 result = {
                     "ok": False,
                     "error": (
-                        "Tool execution failed: "
-                        f"{str(exc).splitlines()[0]}"
+                        "Invalid tool arguments. "
+                        "Expected a JSON object."
                     ),
                 }
 
-            if not result.get("ok", False):
-                sql_failures += 1
+            else:
+                steps.append(
+                    Step(
+                        step_number=iteration,
+                        action="tool_call",
+                        details={
+                            "tool": call.name,
+                            "arguments": _jsonable(arguments),
+                        },
+                    )
+                )
+
+                try:
+                    result = dispatch(call.name, arguments)
+
+                except Exception as exc:
+                    result = {
+                        "ok": False,
+                        "error": (
+                            "Tool execution failed: "
+                            f"{str(exc).splitlines()[0]}"
+                        ),
+                    }
+
+            if isinstance(result, dict):
+                _collect_artifacts(result, artifacts)
+
+            if (
+                not isinstance(result, dict)
+                or not result.get("ok", False)
+            ):
+                tool_failures += 1
+
+                steps.append(
+                    Step(
+                        step_number=iteration,
+                        action="tool_error",
+                        details={
+                            "tool": call.name,
+                            "error": (
+                                result.get(
+                                    "error",
+                                    "Unknown tool error.",
+                                )
+                                if isinstance(result, dict)
+                                else "Tool returned an invalid result."
+                            ),
+                            "failure_count": tool_failures,
+                        },
+                    )
+                )
 
             input_items.append(
                 {
@@ -221,24 +334,26 @@ def run_agent(question: str) -> AgentRun:
                 }
             )
 
-        # Stop after the initial failure plus two retries.
-        if sql_failures >= 3:
+        if tool_failures >= 3:
             return AgentRun(
                 answer=(
-                    "I couldn't complete the query after multiple "
-                    "attempts. Please try rephrasing your question."
+                    "I couldn't complete the request after multiple "
+                    "tool failures. Please try rephrasing your question "
+                    "or simplifying the requested report."
                 ),
                 steps=steps,
                 success=False,
                 error="Tool failure limit reached.",
+                artifacts=artifacts,
             )
 
     return AgentRun(
         answer=(
             "I reached the maximum number of agent steps "
-            "before completing the request."    
+            "before completing the request."
         ),
         steps=steps,
         success=False,
         error="Maximum agent iterations reached.",
+        artifacts=artifacts,
     )
