@@ -1,4 +1,3 @@
-
 """
 Safe executor for validated SQL.
 
@@ -57,6 +56,29 @@ class QueryResult:
         }
 
 
+def _normalize_dataframe(dataframe: pd.DataFrame) -> pd.DataFrame:
+    """
+    Convert PostgreSQL Decimal/object numeric columns to numeric
+    Pandas dtypes so chart tools can recognize revenue and totals.
+    """
+
+    for column in dataframe.columns:
+        if dataframe[column].dtype == object:
+            converted = pd.to_numeric(
+                dataframe[column],
+                errors="coerce",
+            )
+
+            # Convert only if every non-null original value converted.
+            original_non_null = dataframe[column].notna()
+            conversion_valid = converted.notna() | ~original_non_null
+
+            if conversion_valid.all():
+                dataframe[column] = converted
+
+    return dataframe
+
+
 def run_sql(sql: str) -> QueryResult:
     """
     Validate and execute SQL once.
@@ -94,11 +116,12 @@ def run_sql(sql: str) -> QueryResult:
                 columns = list(query_result.keys())
                 fetched_rows = query_result.fetchall()
 
-        # Step 3: Build the full DataFrame from the fetched results.
+        # Step 3: Build the full DataFrame and normalize numeric columns.
         dataframe = pd.DataFrame(
             fetched_rows,
             columns=columns,
         )
+        dataframe = _normalize_dataframe(dataframe)
 
     except SQLAlchemyError as exc:
         message = str(exc).splitlines()[0]

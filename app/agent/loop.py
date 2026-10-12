@@ -1,6 +1,7 @@
+
 """
 Agent loop for the AI Data Agent using OpenAI.
-Tracks generated chart and Excel artifacts.
+Tracks artifacts, token usage, and estimated API cost.
 """
 
 from __future__ import annotations
@@ -17,6 +18,22 @@ from app.agent.tools import TOOLS, dispatch
 from app.config import get_settings
 
 
+# Standard API pricing in USD per one million tokens.
+# Update this table if OpenAI changes its published pricing.
+MODEL_PRICING = {
+    "gpt-5-nano": {
+        "input": 0.05,
+        "cached_input": 0.005,
+        "output": 0.40,
+    },
+    "gpt-5-nano-2025-08-07": {
+        "input": 0.05,
+        "cached_input": 0.005,
+        "output": 0.40,
+    },
+}
+
+
 @dataclass
 class Step:
     """Record one action performed by the agent."""
@@ -28,13 +45,16 @@ class Step:
 
 @dataclass
 class AgentRun:
-    """Store the result of one agent run."""
+    """Store the result and usage information for one agent run."""
 
     answer: str
     steps: list[Step]
     success: bool
     error: str | None = None
     artifacts: list[dict[str, str]] = field(default_factory=list)
+    input_tokens: int = 0
+    output_tokens: int = 0
+    cost_usd: float | None = 0.0
 
 
 def _jsonable(value: Any) -> Any:
@@ -141,34 +161,59 @@ def _collect_artifacts(
 
 
 def run_agent(question: str) -> AgentRun:
-    """Run the OpenAI tool-calling loop."""
+    """Run the tool-calling loop and aggregate API usage."""
+
+    settings = get_settings()
+
+    steps: list[Step] = []
+    artifacts: list[dict[str, str]] = []
+    usage_totals = {
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "cached_input_tokens": 0,
+    }
+
+    model_pricing = MODEL_PRICING.get(settings.openai_model)
+    estimated_cost = 0.0
+
+    def make_run(
+        answer: str,
+        success: bool,
+        error: str | None = None,
+    ) -> AgentRun:
+        """Build every result with the accumulated usage totals."""
+
+        return AgentRun(
+            answer=answer,
+            steps=steps.copy(),
+            success=success,
+            error=error,
+            artifacts=artifacts.copy(),
+            input_tokens=usage_totals["input_tokens"],
+            output_tokens=usage_totals["output_tokens"],
+            cost_usd=(
+                round(estimated_cost, 10)
+                if model_pricing is not None
+                else None
+            ),
+        )
 
     question = question.strip()
 
     if not question:
-        return AgentRun(
-            answer="Please enter a question.",
-            steps=[],
-            success=False,
-            error="Empty question.",
-        )
-
-    settings = get_settings()
+        return make_run("Please enter a question.", False, "Empty question.")
 
     if not settings.openai_api_key.strip():
-        return AgentRun(
-            answer="The OpenAI API key is not configured.",
-            steps=[],
-            success=False,
-            error="Missing OPENAI_API_KEY.",
+        return make_run(
+            "The OpenAI API key is not configured.",
+            False,
+            "Missing OPENAI_API_KEY.",
         )
 
     client = OpenAI(api_key=settings.openai_api_key)
     instructions = build_system_prompt()
     tools = _openai_tools()
 
-    steps: list[Step] = []
-    artifacts: list[dict[str, str]] = []
     tool_failures = 0
     max_iterations = max(1, settings.max_agent_iterations)
 
@@ -197,22 +242,42 @@ def run_agent(question: str) -> AgentRun:
                 Step(
                     step_number=iteration,
                     action="api_error",
-                    details={
-                        "error": error_message,
-                    },
+                    details={"error": error_message},
                 )
             )
 
-            return AgentRun(
-                answer=(
-                    "I couldn't contact the OpenAI service. "
-                    "Check your API key, model access, and billing."
-                ),
-                steps=steps,
-                success=False,
-                error=error_message,
-                artifacts=artifacts,
+            return make_run(
+                "I couldn't contact the OpenAI service. "
+                "Check your API key, model access, and billing.",
+                False,
+                error_message,
             )
+
+        # Accumulate usage for every model response, including tool calls.
+        usage = getattr(response, "usage", None)
+
+        if usage is not None:
+            input_count = int(getattr(usage, "input_tokens", 0) or 0)
+            output_count = int(getattr(usage, "output_tokens", 0) or 0)
+
+            input_details = getattr(usage, "input_tokens_details", None)
+            cached_count = int(
+                getattr(input_details, "cached_tokens", 0) or 0
+            )
+            cached_count = min(cached_count, input_count)
+
+            usage_totals["input_tokens"] += input_count
+            usage_totals["output_tokens"] += output_count
+            usage_totals["cached_input_tokens"] += cached_count
+
+            if model_pricing is not None:
+                uncached_count = input_count - cached_count
+
+                estimated_cost += (
+                    uncached_count * model_pricing["input"]
+                    + cached_count * model_pricing["cached_input"]
+                    + output_count * model_pricing["output"]
+                ) / 1_000_000
 
         input_items.extend(
             item.model_dump(exclude_none=True)
@@ -242,12 +307,7 @@ def run_agent(question: str) -> AgentRun:
                 )
             )
 
-            return AgentRun(
-                answer=answer,
-                steps=steps,
-                success=True,
-                artifacts=artifacts,
-            )
+            return make_run(answer, True)
 
         for call in function_calls:
             try:
@@ -258,11 +318,7 @@ def run_agent(question: str) -> AgentRun:
                         "Tool arguments must be a JSON object."
                     )
 
-            except (
-                json.JSONDecodeError,
-                TypeError,
-                ValueError,
-            ):
+            except (json.JSONDecodeError, TypeError, ValueError):
                 result = {
                     "ok": False,
                     "error": (
@@ -270,6 +326,17 @@ def run_agent(question: str) -> AgentRun:
                         "Expected a JSON object."
                     ),
                 }
+
+                steps.append(
+                    Step(
+                        step_number=iteration,
+                        action="tool_error",
+                        details={
+                            "tool": call.name,
+                            "error": result["error"],
+                        },
+                    )
+                )
 
             else:
                 steps.append(
@@ -298,10 +365,7 @@ def run_agent(question: str) -> AgentRun:
             if isinstance(result, dict):
                 _collect_artifacts(result, artifacts)
 
-            if (
-                not isinstance(result, dict)
-                or not result.get("ok", False)
-            ):
+            if not isinstance(result, dict) or not result.get("ok", False):
                 tool_failures += 1
 
                 steps.append(
@@ -311,10 +375,7 @@ def run_agent(question: str) -> AgentRun:
                         details={
                             "tool": call.name,
                             "error": (
-                                result.get(
-                                    "error",
-                                    "Unknown tool error.",
-                                )
+                                result.get("error", "Unknown tool error.")
                                 if isinstance(result, dict)
                                 else "Tool returned an invalid result."
                             ),
@@ -335,25 +396,17 @@ def run_agent(question: str) -> AgentRun:
             )
 
         if tool_failures >= 3:
-            return AgentRun(
-                answer=(
-                    "I couldn't complete the request after multiple "
-                    "tool failures. Please try rephrasing your question "
-                    "or simplifying the requested report."
-                ),
-                steps=steps,
-                success=False,
-                error="Tool failure limit reached.",
-                artifacts=artifacts,
+            return make_run(
+                "I couldn't complete the request after multiple "
+                "tool failures. Please try rephrasing your question "
+                "or simplifying the requested report.",
+                False,
+                "Tool failure limit reached.",
             )
 
-    return AgentRun(
-        answer=(
-            "I reached the maximum number of agent steps "
-            "before completing the request."
-        ),
-        steps=steps,
-        success=False,
-        error="Maximum agent iterations reached.",
-        artifacts=artifacts,
+    return make_run(
+        "I reached the maximum number of agent steps "
+        "before completing the request.",
+        False,
+        "Maximum agent iterations reached.",
     )
